@@ -12,12 +12,35 @@ from tinygrad.codegen.decomp.transcendental import xpow
 
 # ******** phase 1 of symbolic used to live in ops, it's the most generic folding rules ********
 
+def strip_neg(x:UOp) -> UOp:
+  base, mul = x.pop_const(Ops.MUL)
+  return base if mul == -1 else x
+
 def simplify_pow(x:UOp, c:UOp) -> UOp|None:
   if c.arg < 0: return x.reciprocal().pow(-c)
   if c.arg == 0: return x.const_like(1)
   if int(c.arg-0.5)+0.5 == c.arg: return x.pow(c.const_like(c.arg-0.5)) * x.sqrt()
+  if int(c.arg) == c.arg and c.arg > 0 and c.arg % 2 == 0:
+    # Keep a WHERE only when its even powers do not simplify to the same value.
+    if x.op is Ops.WHERE: cond, t, f, a = *x.src, x.const_like(1)
+    elif x.op is Ops.MUL and (w:=next((i for i,s in enumerate(x.src) if s.op is Ops.WHERE), None)) is not None:
+      cond, t, f, a = *x.src[w].src, prod(x.src[:w]+x.src[w+1:])
+    else:
+      if (base:=strip_neg(x)) is not x: return base.pow(c)
+      cond = None
+    if cond is not None:
+      ret = cond.where((a*strip_neg(t)).pow(c).simplify(), (a*strip_neg(f)).pow(c).simplify()).simplify()
+      if ret.op is not Ops.WHERE: return ret
   if int(c.arg) == c.arg: return (y := x.pow(c.const_like(c.arg//2))) * y * (x if c.arg%2 == 1 else 1)
   return None
+
+def fold_where_zero_gate(cond:UOp, t:UOp, f:UOp) -> UOp|None:
+  if f.op is not Ops.CONST or f.arg != 0 or cond.op is not Ops.CMPNE: return None
+  if cond.src[1].op is Ops.CONST and cond.src[1].arg == 0: x = cond.src[0]
+  elif cond.src[0].op is Ops.CONST and cond.src[0].arg == 0: x = cond.src[1]
+  else: return None
+  at_zero = t.substitute({x:x.const_like(0)}).simplify()
+  return t if at_zero.op is Ops.CONST and at_zero.arg == 0 else None
 
 def fold_bitcast(root:UOp, c:UOp) -> UOp|None:
   if (from_fmt:=c.dtype.fmt) is None or (to_fmt:=root.dtype.fmt) is None: return None
@@ -180,6 +203,7 @@ symbolic_simple = propagate_invalid + PatternMatcher([
   # a conditional with the same results either way is a noop, also fold const conditionals
   (UPat.var().where(UPat.var("val"), UPat.var("val")), lambda val: val),
   (UPat.cvar("gate").where(UPat.var("c0"), UPat.var("c1")), lambda gate, c0, c1: c0 if gate.arg else c1),
+  (UPat.var("cond", dtype=dtypes.bool).where(UPat.var("t"), UPat.var("f")), fold_where_zero_gate),
   # a.where(b.where(c, d), d) -> (a & b).where(c, d)
   (UPat.var("a").where(UPat.var("b").where(UPat.var("c"), UPat.var("d")), UPat.var("d")), lambda a,b,c,d: (a&b).where(c,d)),
 ])+mop_cleanup
