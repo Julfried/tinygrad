@@ -2,6 +2,7 @@
 import unittest, pickle, functools, math
 import z3
 
+from tinygrad import Tensor
 from tinygrad.dtype import dtypes, ConstType, DType, Invalid
 from test.helpers import get_uops
 from tinygrad.uop.ops import UOp, Ops, graph_rewrite, sym_infer
@@ -930,6 +931,31 @@ class TestSymbolic(unittest.TestCase):
     self.helper_test_variable(cond.where(u1, u0).where(u1, u0), 0, 1, "(a<2)")
     self.helper_test_variable(cond.where(u0, u1), 0, 1, "((a<2)!=True)")
     self.helper_test_variable(cond.where(u0, u1).where(u0, u1), 0, 1, "(a<2)")
+
+  def test_even_pow_where(self):
+    for dtype in (dtypes.int, dtypes.float):
+      x = Variable("x", -3, 3, dtype)
+      a = Variable("a", 1, 3, dtype)
+      for cond, t, f in ((x < 0, x, -x), (0 <= x, -x, x)):
+        for exponent in (2, 4, 6, 20):
+          for base in (cond.where(t, f), a*cond.where(t, f), -cond.where(t, f)):
+            simplified = graph_rewrite(base.pow(exponent), sym, name="simplify even where pow")
+            self.assertNotIn(Ops.WHERE, {u.op for u in simplified.toposort()})
+        odd = graph_rewrite(cond.where(t, f).pow(3), sym, name="simplify odd where pow")
+        self.assertIn(Ops.WHERE, {u.op for u in odd.toposort()})
+
+  def test_zero_gate_folding(self):
+    x = Variable("x", -3, 3, dtypes.float)
+    y = Variable("y", -3, 3, dtypes.float)
+    self.assertIs(graph_rewrite((x != 0).where(x*y, 0), sym, name="fold zero gate"), x*y)
+    self.assertIs(graph_rewrite((0 != x).where(x*y, 0), sym, name="fold reversed zero gate"), x*y)
+    for value in (float("inf"), float("nan")):
+      simplified = graph_rewrite((x != 0).where(x*value, 0), sym, name="keep unsafe zero gate")
+      self.assertEqual(simplified.op, Ops.WHERE)
+
+  def test_abs_square_scheduled_without_where(self):
+    ast = (Tensor([11.]).abs()**2).schedule_linear().src[-1].src[0]
+    self.assertNotIn(Ops.WHERE, {u.op for u in ast.toposort()})
 
   def test_where_combine(self):
     cond = Variable("x", 0, 3) < 2
