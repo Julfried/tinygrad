@@ -406,6 +406,12 @@ class CUDARenderer(CStyleLanguage):
     iface, dev, arch = target.interface, target.device, target.arch
     self.compiler = (NVCCCompiler if use_nvcc else NVRTCCompiler)(arch, ptx=iface.startswith("MOCK") or dev == "CUDA", cache_key=dev.lower())
     self.tensor_cores = tc.get_cuda(arch)
+    # a LOAD flagged nontemporal renders as a streaming load: streamed data must not evict hot data from L2.
+    # only scalar dtypes with a __ldcs overload (no fp16/bf16); anything else falls through to a normal load
+    self.string_rewrite = PatternMatcher([(UPat(Ops.LOAD, arg="nontemporal", src=(UPat.var("bidx"),), name="x"),
+      lambda ctx,bidx,x: f"__ldcs({ctx.render_ptr(bidx)})" if x.dtype in (
+        dtypes.int8, dtypes.uint8, dtypes.int16, dtypes.uint16, dtypes.int32, dtypes.uint32,
+        dtypes.int64, dtypes.uint64, dtypes.float32, dtypes.float64) else None)]) + self.string_rewrite
 
   # language options
   # https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html

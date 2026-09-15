@@ -21,6 +21,12 @@ def custom_eye_kernel(C:UOp) -> UOp:
   j = UOp.range(C.shape[1], 1)
   return C[i, j].store((i.eq(j)).cast(C.dtype)).end(i, j).sink(arg=KernelInfo(name=f"custom_eye_{C.numel()}"))
 
+def custom_streaming_copy_kernel(C:UOp, A:UOp) -> UOp:
+  A, C = A.flatten(), C.flatten()
+  assert C.numel() == A.numel()
+  i = UOp.range(C.numel(), 0)
+  return C[i].store(A[i].load(arg="nontemporal")).end(i).sink(arg=KernelInfo(name=f"streaming_copy_{C.numel()}"))
+
 def custom_add_one_kernel(B:UOp, A:UOp) -> UOp:
   A,B = A.flatten(), B.flatten()
   assert B.numel() == A.numel()
@@ -172,6 +178,13 @@ class TestCustomKernel(unittest.TestCase):
     ref = Tensor.eye(1024).clone().realize()
     tst = Tensor.empty_like(ref)
     tst = tst.custom_kernel(fxn=custom_eye_kernel)[0]
+    self.assertTrue((ref == tst).all().item())
+
+  @unittest.skipUnless(Device.DEFAULT.split(":")[0] == "CUDA", "streaming loads need CUDA")
+  def test_streaming_copy(self):
+    ref = Tensor.randn(4096).clone().realize()
+    tst = Tensor.empty_like(ref)
+    tst = tst.custom_kernel(ref, fxn=custom_streaming_copy_kernel)[0]
     self.assertTrue((ref == tst).all().item())
 
   @unittest.skip("contract shouldn't be supported here")
