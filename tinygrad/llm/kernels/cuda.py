@@ -59,6 +59,49 @@ def cuda_q8_quantize(x:Tensor, tokens:int, in_features:int) -> tuple[Tensor, Ten
   return q, scale
 
 @functools.cache
+def _cuda_rms_kernel(rrms:UOp, x:UOp, tokens:int, in_features:int, eps:float) -> UOp:
+  # one warp per token streams the whole row: per-lane partial sums, then a warp reduce
+  token, lane = UOp.range(tokens, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
+  acc = UOp.const(0, dtypes.float32)
+  xr = x.reshape(tokens, in_features)
+  for k in range(in_features//32):
+    v = xr[token, lane+k*32].load().float()
+    acc = acc + v*v
+  mean = cuda_warp_reduce(acc, full_wave=True)*(1.0/in_features) + eps
+  return rrms[token.valid(lane.eq(0))].store(mean.rsqrt()).end(token, lane).sink(
+    arg=KernelInfo(name="rms_cuda", opts_to_apply=()))
+
+@functools.cache
+def _cuda_rmsnorm_quantize_kernel(q:UOp, scale:UOp, xn:UOp, x:UOp, w:UOp, rrms:UOp, tokens:int, in_features:int) -> UOp:
+  # same grid as the plain quantize kernel: norm*weight folds into the loaded value, scales pack identically.
+  # the normed row is also stored for dense (non-quantized) consumers sharing this norm.
+  groups = in_features//Q8_GROUP_SIZE
+  token_group, lane = UOp.range(tokens*groups, 0, AxisType.GLOBAL), UOp.range(32, -1, AxisType.WARP)
+  token, group = token_group//groups, token_group%groups
+  rr = rrms[token].load()
+  value = x.reshape(tokens, groups, 32)[token, group, lane].float()*rr*w[group*32+lane].load().float()
+  d = (cuda_warp_reduce(value.abs(), maximum=True, full_wave=True)/127).maximum(1e-8)
+  quant = UOp(Ops.CUSTOM, src=(value/d,), arg=("rintf({0})", dtypes.float)).clip(-127, 127).cast(dtypes.int8)
+  word = quant.cast(dtypes.uint8).cast(dtypes.uint32) << ((lane%4)*8).cast(dtypes.uint32)
+  for offset in (1, 2):
+    word |= UOp(Ops.CUSTOM, src=(word,), arg=(f"__shfl_xor_sync(0xffffffff, {{0}}, {offset})", dtypes.uint32))
+  stores = (q[token, group, (lane//4).valid((lane%4).eq(0))].store(word),
+            scale[token, group.valid(lane.eq(0))].store(d),
+            xn[token, group*32+lane].store(value))
+  return UOp.group(*stores).end(token_group, lane).sink(arg=KernelInfo(name="rmsnorm_q8_quantize_cuda", opts_to_apply=()))
+
+def cuda_rmsnorm_quantize(x:Tensor, norm_weight:Tensor, eps:float, tokens:int, in_features:int) -> tuple[Tensor, Tensor, Tensor]:
+  groups = in_features//Q8_GROUP_SIZE
+  rrms = Tensor.empty(tokens, dtype=dtypes.float32, device=x.device)
+  rrms, = Tensor.custom_kernel(rrms, x, fxn=functools.partial(_cuda_rms_kernel, tokens=tokens, in_features=in_features, eps=eps))[:1]
+  q = Tensor.empty(tokens, groups, 8, dtype=dtypes.uint32, device=x.device)
+  scale = Tensor.empty(tokens, groups, dtype=dtypes.float32, device=x.device)
+  xn = Tensor.empty(tokens, in_features, dtype=dtypes.float32, device=x.device)
+  q, scale, xn = Tensor.custom_kernel(q, scale, xn, x, norm_weight, rrms,
+    fxn=functools.partial(_cuda_rmsnorm_quantize_kernel, tokens=tokens, in_features=in_features))[:3]
+  return q, scale, xn
+
+@functools.cache
 def _cuda_iq4_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, lut:UOp, out_features:int, in_features:int) -> UOp:
   group_count = in_features // Q8_GROUP_SIZE
   chunks = out.shape[2]
@@ -85,17 +128,60 @@ def _cuda_iq4_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, lut:UOp, out_featu
   return out[token, output, chunk.valid(lane.eq(0))].store(total.cast(out.dtype)).end(token_output, chunk, lane).sink(
     arg=KernelInfo(name="linear_iq4_xs_cuda", opts_to_apply=()))
 
-def cuda_iq4_linear(layer:nn.Linear, x:Tensor) -> Tensor:
+def cuda_iq4_decode(raw:UOp, xq:Tensor, xd:Tensor, out_features:int, in_features:int, tokens:int,
+                      out_shape:tuple[int, ...], bias:Tensor|None, device:str) -> Tensor:
   from tinygrad.runtime.autogen.ggml_common import kvalues_iq4nl
-  tokens = int(x.numel()) // layer.in_features
-  raw, out_features, in_features = layer.weight.uop, layer.out_features, layer.in_features
-  lut = Tensor(list(kvalues_iq4nl), dtype=dtypes.int8, device=x.device)
-  xq, xd = cuda_q8_quantize(x.contiguous(), tokens, in_features)
-  out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
+  lut = Tensor(list(kvalues_iq4nl), dtype=dtypes.int8, device=device)
+  out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=device).uop
   params = tuple(UOp.placeholder_like(src, slot=i) for i, src in enumerate((out, raw, xq.uop, xd.uop, lut.uop)))
   kernel = _cuda_iq4_decode_kernel(*params, out_features=out_features, in_features=in_features).call(out, raw, xq.uop, xd.uop, lut.uop)
-  result = Tensor(out.after(kernel)).sum(-1).reshape(*x.shape[:-1], out_features)
-  return result if layer.bias is None else result + layer.bias
+  result = Tensor(out.after(kernel)).sum(-1).reshape(*out_shape[:-1], out_features)
+  return result if bias is None else result + bias
+
+def cuda_iq4_linear(layer:nn.Linear, x:Tensor) -> Tensor:
+  tokens = int(x.numel()) // layer.in_features
+  raw, out_features, in_features = layer.weight.uop, layer.out_features, layer.in_features
+  xq, xd = cuda_q8_quantize(x.contiguous(), tokens, in_features)
+  return cuda_iq4_decode(raw, xq, xd, out_features, in_features, tokens, x.shape, layer.bias, str(x.device))
+
+def _cuda_fused_ready(layer:nn.Linear) -> bool:
+  # mirror Linear.__call__'s preamble: resolve the packed type, accept IQ4_XS with q8-compatible width
+  if layer.ggml_type is None:
+    if not layer.use_custom_quant or not cuda_custom_kernels_supported(layer.weight.device): return False
+    orig = layer.weight
+    layer.set_quantized(layer.weight)
+    if layer.ggml_type is None:
+      layer.use_custom_quant = False
+      return False
+    if layer.ggml_type != IQ4_XS:
+      layer.weight, layer.ggml_type, layer.use_custom_quant = orig, None, False
+      return False
+  return layer.ggml_type == IQ4_XS and layer.in_features % Q8_GROUP_SIZE == 0
+
+def cuda_fused_norm_linears(norm:"nn.RMSNorm", x:Tensor, layers:list["nn.Linear"]) -> list[Tensor]|None:
+  # one shared RMSNorm+int8 quantize, one decode per quantized consumer. dense consumers read the stored
+  # normed row. None = no quantized consumer, fall back to generic norm+linears.
+  if not layers or not cuda_custom_kernels_supported(x.device or layers[0].weight.device): return None
+  in_features = layers[0].in_features
+  if x.shape[-1] != in_features or norm.weight.shape[0] != in_features: return None
+  dev = x.device or layers[0].weight.device
+  if any(l.in_features != in_features or l.bias is not None and l.bias.shape[0] != l.out_features for l in layers): return None
+  if x.device is not None and str(x.device) != str(dev): return None
+  if any(str(l.weight.device) != str(dev) for l in layers): return None
+  ready = [_cuda_fused_ready(l) for l in layers]
+  if not any(ready): return None
+  xp = x if isinstance(x.numel(), int) else x.pad_to(x.max_shape)
+  xc, w = xp.contiguous(), norm.weight.contiguous()
+  tokens = int(xc.numel()) // in_features
+  xq, xd, xn = cuda_rmsnorm_quantize(xc, w, norm.eps, tokens, in_features)
+  xn = xn.reshape(xc.shape)
+  outs: list[Tensor] = []
+  for l, r in zip(layers, ready):
+    outs.append(cuda_iq4_decode(l.weight.uop, xq, xd, l.out_features, in_features, tokens, xc.shape, l.bias, str(dev)) if r
+                else l(xn))
+  if xp is not x:
+    outs = [o.shrink(tuple((0, s) for s in (*x.shape[:-1], l.out_features))) for o, l in zip(outs, layers)]
+  return outs
 
 class Linear(AMDLinear):
   def _generic_quant(self, x:Tensor) -> Tensor:
