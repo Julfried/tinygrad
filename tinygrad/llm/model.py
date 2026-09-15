@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels import Linear, gated_delta_prefill, gated_delta_supported, flash_attention, flash_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -183,8 +183,8 @@ class TransformerBlock(FFNBlock):
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
-    # on RDNA3, hybrid models use custom flash attention kernels on the KV cache
-    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
+    # hybrid models use custom flash attention kernels on the KV cache where supported
+    if flash_supported(x.device) and self.config.ssm is not None:
       attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
@@ -323,8 +323,8 @@ class GatedDeltaNetBlock(FFNBlock):
 
     # recurrent: scan over the (padded) tokens, updating the recurrent state. collect the per-step outputs
     state = Tensor(self.recurrent_state.uop.after(conv_state_store))  # carry the conv write into this graph
-    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and amd_custom_kernels_supported(x.device):
-      # one fused kernel for the whole scan; it resets and updates the recurrent state in place (RDNA3)
+    if self.head_k_dim % 32 == 0 and self.head_v_dim % 4 == 0 and gated_delta_supported(x.device):
+      # one fused kernel for the whole scan; it resets and updates the recurrent state in place
       core = gated_delta_prefill(q, k, v, beta, alpha, state, Tensor(start_pos)).transpose(1, 2)
     else:
       q, k, v, beta = q.unsqueeze(-2), k.unsqueeze(-2), v.unsqueeze(-1), beta.unsqueeze(-1).unsqueeze(-1)
@@ -476,7 +476,7 @@ class Transformer:
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
-    if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
+    if self.has_recurrent_block and not gated_delta_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)
     v_toks = UOp.variable("toks", 1, chunk_size)
     # TODO: use UOp.variable for temperature once float variables are supported
