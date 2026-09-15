@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels import Linear, gated_delta_prefill, gated_delta_supported, flash_attention, flash_supported
+from tinygrad.llm.kernels import Linear, fused_norm_linears, gated_delta_prefill, gated_delta_supported, flash_attention, flash_supported
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
@@ -108,6 +108,7 @@ class FFNBlock:
 
   def _feed_forward(self, x:Tensor) -> Tensor:
     if hasattr(self, 'ffn_gate_exps'):
+      x = self.ffn_norm(x)
       h = x.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       logits = self.ffn_gate_inp(x)
       bias = self.exp_probs_b["bias"] if hasattr(self, 'exp_probs_b') else None
@@ -134,7 +135,8 @@ class FFNBlock:
         out = out + shexp
       return out
     # TODO: remove the need for this contiguous
-    return self.ffn_down(self.ffn_gate(x).silu().contiguous() * self.ffn_up(x))
+    gate, up = fused_norm_linears(self.ffn_norm, x, [self.ffn_gate, self.ffn_up])
+    return self.ffn_down(gate.silu().contiguous() * up)
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
@@ -146,8 +148,8 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      h =     x + self._attention(x, start_pos)
+      return (h + self._feed_forward(h)).contiguous()
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
@@ -165,7 +167,7 @@ class TransformerBlock(FFNBlock):
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
-    q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
+    q, k, v = fused_norm_linears(self.attn_norm, x, [self.attn_q, self.attn_k, self.attn_v])
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
@@ -227,6 +229,7 @@ class MLATransformerBlock(FFNBlock):
     self.attn_output = Linear(config.n_heads * config.v_head_dim, config.dim, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
+    x = self.attn_norm(x)
     B, T, _ = x.shape
     q_nope_head_dim = self.config.head_dim - self.config.rope_dim
     q_proj = self.attn_q_b(self.attn_q_a_norm(self.attn_q_a(x))) if self.config.q_lora_rank > 0 else self.attn_q(x)
@@ -287,11 +290,14 @@ class GatedDeltaNetBlock(FFNBlock):
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
 
     # input processing
-    x = x.half()
-    out_gate = self.ssm_g_b(self.ssm_g_a(x)) if is_kda else self.attn_gate(x)
+    if is_kda:
+      x = self.attn_norm(x).half()
+      out_gate = self.ssm_g_b(self.ssm_g_a(x))
+    else:
+      out_gate, alpha, beta, qkv = fused_norm_linears(self.attn_norm, x, [self.attn_gate, self.ssm_alpha, self.ssm_beta, self.attn_qkv])
     out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
-    beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
-    alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else self.ssm_alpha(x)
+    beta = beta.sigmoid().reshape(B, T, self.num_v_heads) if not is_kda else self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
+    alpha = self.ssm_f_b(self.ssm_f_a(x)) if is_kda else alpha
     log_alpha = ((alpha.float() + self.ssm_dt["bias"]).softplus().reshape(B, T, self.num_v_heads, -1) *
                  self.ssm_a.reshape(self.num_v_heads, -1))
 
@@ -301,7 +307,7 @@ class GatedDeltaNetBlock(FFNBlock):
     # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
     win = Tensor.zeros(B, self.ssm_conv_kernel-1 + T_pad, self.conv_channels).uop
     win = win.after(win[:, :self.ssm_conv_kernel-1].store(conv_state.cast(win.dtype).uop))
-    win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store(self.attn_qkv(x).cast(win.dtype).uop))
+    win = win.after(win[:, self.ssm_conv_kernel-1:self.ssm_conv_kernel-1+T].store((self.attn_qkv(x) if is_kda else qkv).cast(win.dtype).uop))
     conv_window = Tensor(win)
     # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop)
@@ -373,7 +379,7 @@ class Transformer:
     x = self.token_embd(tokens).float()                   # (B, T, D)
     for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
-    logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
+    logits = fused_norm_linears(self.output_norm, x[:, -1:], [self.output])[0][:, -1, :]
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
